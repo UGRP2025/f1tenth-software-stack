@@ -20,7 +20,7 @@ class SafetyNode(Node):
     # SafetyNode 클래스는 ROS 2 노드를 상속받아 정의합니다.
 
     def __init__(self):
-        super().__init__('aeb_node')
+        super().__init__('simple_safety_node')
         # 노드 이름을 'aeb_node'로 설정하고 부모 클래스(Node)를 초기화합니다.
         self.speed = 0.  # 현재 속도를 저장하는 변수 (m/s)
         self.desired_speed = 2.0  # 원하는 기본 속도 설정 (m/s)
@@ -31,7 +31,7 @@ class SafetyNode(Node):
         # ROS 구독자와 퍼블리셔 생성
         self.sub_scan = self.create_subscription(LaserScan, '/scan', self.scan_callback, 10)
         # '/scan' 토픽을 구독하고, LaserScan 메시지를 수신할 때 scan_callback을 호출
-        self.sub_odom = self.create_subscription(Odometry, '/ego_racecar/odom', self.odom_callback, 10)
+        self.sub_odom = self.create_subscription(Odometry, '/odom', self.odom_callback, 10)
         # '/ego_racecar/odom' 토픽을 구독하고, Odometry 메시지를 수신할 때 odom_callback을 호출
         self.pub_drive = self.create_publisher(AckermannDriveStamped, '/drive', 10)
         # '/drive' 토픽에 퍼블리시할 퍼블리셔 생성
