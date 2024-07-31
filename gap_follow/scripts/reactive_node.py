@@ -143,11 +143,11 @@ class ReactiveFollowGap(Node):
         # set the velocity
         # velocity = 0.5
         if sum(data.ranges[530:549]) / 20 < 2.0:
-            velocity = 2.0
+            velocity = 1.0
         # elif sum(data.ranges[530:549]) / 20 < 3.0:
         #     velocity = 3.5
         else:
-            velocity = 5.0
+            velocity = 3.0
         # if abs(self.drive_msg.drive.steering_angle) < np.pi / 18:
         #     velocity = 5.0
         # else:
