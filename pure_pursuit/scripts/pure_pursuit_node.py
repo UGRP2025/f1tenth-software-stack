@@ -40,7 +40,7 @@ class PurePursuit(Node):
         self.pub_vis = self.create_publisher(MarkerArray, visualization_topic, 1)
         self.markerArray = MarkerArray()
 
-        map_path = os.path.abspath(os.path.join('src', 'csv_data'))
+        map_path = os.path.abspath(os.path.join('src', "f1tenth-software-stack",'csv_data'))
         csv_data = np.loadtxt(map_path + '/' + self.map_name + '.csv', delimiter=';', skiprows=0)  # csv data
         self.waypoints = csv_data[:, 1:3]  # first row is indices
         self.numWaypoints = self.waypoints.shape[0]
