@@ -49,6 +49,7 @@ class PurePursuit(Node):
         # self.ref_speed = csv_data[:, 5]  # max speed - sim is 10m/s
 
         self.visualization_init()
+        self.steering_gain = 0.5
 
     def pose_callback(self, pose_msg):
         
