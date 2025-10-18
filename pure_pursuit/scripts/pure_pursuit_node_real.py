@@ -27,7 +27,7 @@ class PurePursuit(Node):
 
         self.is_real = True
         self.is_ascending = True  # waypoint indices are ascending during tracking
-        self.map_name = 'pnu_track'
+        self.map_name = 'TEST'
         # Topics & Subs, Pubs
         drive_topic = '/drive'
         odom_topic = '/pf/viz/inferred_pose' if self.is_real else '/ego_racecar/odom'
