@@ -21,6 +21,7 @@ setup(
     entry_points={
         'console_scripts': [
             'pure_pursuit_node = pure_pursuit.pure_pursuit_node:main',
+            'avoidance_PP' = pure_pursuit.pure_pursuit_node_real:main',
         ],
     },
 )
