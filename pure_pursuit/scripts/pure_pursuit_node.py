@@ -50,18 +50,6 @@ class PurePursuit(Node):
 
         self.visualization_init()
 
-        # params for levine 2nd - real
-        # self.L = 2.2
-        # self.steering_gain = 0.45
-        
-        # params for skir - real
-        # self.L = 2.2
-        # self.steering_gain = 0.45
-
-        # sim params
-        self.L = 0.8
-        self.steering_gain = 0.5
-
     def pose_callback(self, pose_msg):
         
         # Get current pose
@@ -80,8 +68,18 @@ class PurePursuit(Node):
         self.closest_index = np.argmin(self.distances)
         self.closestPoint = self.waypoints[self.closest_index]
 
+        # 추정 속도 v_est 계산 (ref_speed 사용 또는 odometry 기반)
+        v_est = self.ref_speed[self.closest_index]
+
+        # adaptive lookahead
+        LD_MIN = 0.6   # 최소 lookahead (m)
+        LD_MAX = 1.0   # 최대 lookahead (m)
+        K_LD_V = 0.2   # 속도에 따른 scaling 계수 (튜닝 필요)
+
+        Ld = np.clip(LD_MIN + K_LD_V * v_est, LD_MIN, LD_MAX)
+
         # Find target point
-        targetPoint = self.get_closest_point_beyond_lookahead_dist(self.L)
+        targetPoint = self.get_closest_point_beyond_lookahead_dist(Ld)
 
         # Homogeneous transformation
         translatedTargetPoint = self.translatePoint(targetPoint)
