@@ -86,7 +86,7 @@ class PurePursuit(Node):
         
         # calculate curvature/steering angle
         y = translatedTargetPoint[1]
-        gamma = self.steering_gain * (2 * y / self.L**2)
+        gamma = self.steering_gain * (2 * y / Ld**2)
 
         # publish drive message, don't forget to limit the steering angle.
         gamma = np.clip(gamma, -0.35, 0.35)
