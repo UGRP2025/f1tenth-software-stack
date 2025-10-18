@@ -56,7 +56,7 @@ ament_python_install_package(${PROJECT_NAME})
 # Install Python executables
 install(PROGRAMS
   scripts/pure_pursuit_node.py
-  scripts/final_race_pure_pursuit_node.py
+  scripts/pure_pursuit_node_real.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
