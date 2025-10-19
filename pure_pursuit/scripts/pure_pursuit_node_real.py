@@ -43,11 +43,11 @@ class PurePursuit(Node):
         self.markerArray = MarkerArray()
 
         map_path = os.path.abspath(os.path.join('src', "f1tenth-software-stack", 'csv_data'))
-        csv_data = np.loadtxt(map_path + '/' + self.map_name + '.csv', delimiter=',', skiprows=1)  # csv data
-        self.waypoints = csv_data[:, :]  # first row is indices
+        csv_data = np.loadtxt(map_path + '/' + self.map_name + '.csv', delimiter=';', skiprows=1)  # csv data
+        self.waypoints = csv_data[:, 1:3]  # first row is indices
         self.numWaypoints = self.waypoints.shape[0]
 
-        # self.ref_speed = csv_data[:, 5] * 0.6  # max speed for levine 2nd - real is 2m/s
+        self.ref_speed = csv_data[:, 5] * 0.33  # max speed for levine 2nd - real is 2m/s
         #self.ref_speed = 2.0  csv_data[:, 5]  # max speed - sim is 10m/s
 
         self.visualization_init()
@@ -95,7 +95,7 @@ class PurePursuit(Node):
         # publish drive message, don't forget to limit the steering angle.
         gamma = np.clip(gamma, -0.35, 0.35)
         self.drive_msg.drive.steering_angle = gamma
-        self.drive_msg.drive.speed = (-1.0 if self.is_real else 1.0) * self.ref_speed
+        self.drive_msg.drive.speed = self.ref_speed[self.closest_index]
         self.pub_drive.publish(self.drive_msg)
         print("steering = {}, speed = {}".format(round(self.drive_msg.drive.steering_angle, 2), round(self.drive_msg.drive.speed, 2)))
 
