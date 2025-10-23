@@ -23,8 +23,9 @@
 #include <tf2_ros/transform_broadcaster.h>
 #include "std_msgs/msg/float32.hpp"
 #include "std_msgs/msg/bool.hpp"
-//#include "std_msgs/msg/float32multiarray.hpp"
 #include "geometry_msgs/msg/pose_array.hpp"
+#include "rrt/spline.h"
+
 /// CHECK: include needed ROS msg type headers and libraries
 
 using namespace std;
@@ -44,7 +45,7 @@ public:
     RRT();
     virtual ~RRT();
 
-    float update_rate = 0.04;//Time between updating rrt graph. Time to execute RRT* is around 0.0001 min to 0.002 sec. Recommended to keep above 0.03
+
 
     const static int occu_grid_x_size=135;//always make this an even number
     const static int occu_grid_y_size=125;//always make this an even
@@ -65,10 +66,20 @@ public:
     int occu_grid_flat[x_size * y_size]= {0};
 
     //RRT Stuff
-    float max_expansion_dist = 0.5; //meters
-    int max_iter = 500;
-    float goal_threshold = 0.1; //meters
-    float l_value=3;
+    // RRT Parameters
+    int rrt_max_iter_;
+    double rrt_max_expansion_dist_;
+    double rrt_goal_threshold_;
+    double rrt_near_gamma_;
+
+    // RRT Logic Parameters
+    double rrt_update_rate_;
+    int rrt_activation_hits_;
+    double rrt_sample_radius_;
+        double rrt_goal_bias_;
+    
+        // Lookahead distance
+        double lookahead_distance_;
     nav_msgs::msg::Odometry global_goal;
 
     rclcpp::Time previous_time = rclcpp::Clock().now();
@@ -77,8 +88,21 @@ public:
     std::vector<RRT_Node> final_path_output;
     nav_msgs::msg::Odometry current_goal;
 
-
     std::vector<std::vector<float>> spline_points;
+
+    // Pure Pursuit Members
+    double global_L_ = 1.5;
+    bool use_rrt_ = false;
+    std::vector<std::vector<double>> waypoints_;
+    Spline x_spline_, y_spline_;
+    std::vector<RRT_Node> global_spline_points_;
+
+    // Controller Parameters
+    double wheelbase_;
+    double max_steering_angle_;
+    double max_speed_;
+    double min_speed_;
+
 private:
     // TODO: add the publishers and subscribers you need
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr pose_sub_;
@@ -92,6 +116,8 @@ private:
     rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr global_goal_sub_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr local_goal_pub;
     rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr pure_pursuit_standoff_;
+    rclcpp::Publisher<ackermann_msgs::msg::AckermannDriveStamped>::SharedPtr drive_pub_;
+    rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr use_rrt_sub_;
 
     rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr grid_path_pub;
     rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr use_rrt_pub;
@@ -110,10 +136,11 @@ private:
     void global_goal_callback(const nav_msgs::msg::Odometry::ConstSharedPtr goal_msg);
 
     void standoff_callback(const std_msgs::msg::Float32::ConstSharedPtr l_dist);
+    void use_rrt_callback(const std_msgs::msg::Bool::ConstSharedPtr use_rrt_msg);
 
     std::vector<RRT_Node> perform_rrt();
     // RRT methods
-    std::vector<double> sample();
+    std::vector<double> sample(double goal_x, double goal_y);
     int nearest(std::vector<RRT_Node> &tree, std::vector<double> &sampled_point);
     RRT_Node steer(RRT_Node &nearest_node, std::vector<double> &sampled_point);
     bool check_collision(RRT_Node &nearest_node, RRT_Node &new_node);
@@ -135,5 +162,13 @@ private:
     std::vector<std::vector<int>> bresenhams_line_algorithm(int goal_point[2], int origin_point[2]);
     void check_to_activate_rrt(std::vector<signed char> &obstacle_data);
 
-};
+    // Pure Pursuit methods
+    void load_waypoints(const std::string& map_name);
+    void create_global_spline();
+    void pure_pursuit_control();
+    int get_closest_point(const std::vector<RRT_Node>& points, const geometry_msgs::msg::Point& current_pos);
+    RRT_Node find_goal_point_on_path(const std::vector<RRT_Node>& path, int& start_index, double lookahead_distance);
+    geometry_msgs::msg::Point transform_point(const geometry_msgs::msg::Point& point, const geometry_msgs::msg::Pose& pose);
 
+
+};
