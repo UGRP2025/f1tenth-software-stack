@@ -57,6 +57,8 @@ ament_python_install_package(${PROJECT_NAME})
 install(PROGRAMS
   scripts/pure_pursuit_node.py
   scripts/pure_pursuit_node_real.py
+  scripts/multi_lane_stanley.py
+  scripts/rrt_star_obstacle_avoidance.py
   DESTINATION lib/${PROJECT_NAME}
 )
 
