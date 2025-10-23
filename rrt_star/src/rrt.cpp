@@ -4,14 +4,14 @@
 #include "rrt/rrt.h"
 #include "nav_msgs/msg/occupancy_grid.hpp"
 #include <Eigen/Geometry>
+#include <Eigen/Dense>
 #include "std_msgs/msg/bool.hpp"
 #include <math.h>
 #include "visualization_msgs/msg/marker.hpp"
 #include "visualization_msgs/msg/marker_array.hpp"
-//#include "std_msgs/msg/float32multiarray.hpp"
-//#include "std_msgs/msg/MultiArrayDimension.hpp"
 #include "geometry_msgs/msg/pose_array.hpp"
 #include <ament_index_cpp/get_package_share_directory.hpp>
+#include <algorithm>
 
 
 // Destructor of the RRT class
@@ -23,73 +23,255 @@ RRT::~RRT() {
 // Constructor of the RRT class
 RRT::RRT(): rclcpp::Node("rrt_node"), gen((std::random_device())()) {
     // ROS publishers
-    //For vizualization
     grid_pub = this->create_publisher<nav_msgs::msg::OccupancyGrid>("/rrt_occugrid_rviz",1);
     rrt_rviz = this->create_publisher<visualization_msgs::msg::Marker>("/rrt_node_connections_rviz",1);
     rrt_path_rviz = this->create_publisher<visualization_msgs::msg::Marker>("/rrt_path_connections_rviz",1);
     goal_pub = this->create_publisher<visualization_msgs::msg::Marker>("/rrt_goal_point_rviz",1);
     node_pub = this->create_publisher<visualization_msgs::msg::MarkerArray>("/rrt_all_nodes_rviz",1);
     path_pub = this->create_publisher<visualization_msgs::msg::MarkerArray>("/rrt_path_nodes_rviz",1);
-
     grid_path_pub = this->create_publisher<nav_msgs::msg::OccupancyGrid>("/rrt__path_occugrid_rviz",1);
     use_rrt_pub = this->create_publisher<std_msgs::msg::Bool>("/use_rrt",1);
-
     local_goal_pub = this->create_publisher<nav_msgs::msg::Odometry>("/rrt_local_goal",1);
-
     spline_points_pub = this->create_publisher<geometry_msgs::msg::PoseArray>("/rrt_spline_points",1);
+    drive_pub_ = this->create_publisher<ackermann_msgs::msg::AckermannDriveStamped>("/drive", 1);
 
     // ROS subscribers
-    // TODO: create subscribers as you need
     string pose_topic = "ego_racecar/odom";
     string scan_topic = "/scan";
     string global_goal_topic = "/global_goal_pure_pursuit";
     string standoff_topic = "/standoff_dist_pure_pursuit";
+    string use_rrt_topic = "/use_rrt";
 
     pose_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-    pose_topic, 1, std::bind(&RRT::pose_callback, this, std::placeholders::_1));
+        pose_topic, 1, std::bind(&RRT::pose_callback, this, std::placeholders::_1));
 
     scan_sub_ = this->create_subscription<sensor_msgs::msg::LaserScan>(
-    scan_topic, 1, std::bind(&RRT::scan_callback, this, std::placeholders::_1));
+        scan_topic, 1, std::bind(&RRT::scan_callback, this, std::placeholders::_1));
 
     global_goal_sub_ = this->create_subscription<nav_msgs::msg::Odometry>(
-    global_goal_topic, 1, std::bind(&RRT::global_goal_callback, this, std::placeholders::_1));
+        global_goal_topic, 1, std::bind(&RRT::global_goal_callback, this, std::placeholders::_1));
 
     pure_pursuit_standoff_ = this->create_subscription<std_msgs::msg::Float32>(
-    standoff_topic, 1, std::bind(&RRT::standoff_callback, this, std::placeholders::_1));
+        standoff_topic, 1, std::bind(&RRT::standoff_callback, this, std::placeholders::_1));
+
+    use_rrt_sub_ = this->create_subscription<std_msgs::msg::Bool>(
+        use_rrt_topic, 1, std::bind(&RRT::use_rrt_callback, this, std::placeholders::_1));
 
     previous_time = rclcpp::Clock().now();
 
-    // TODO: create a occupancy grid
     RCLCPP_INFO(rclcpp::get_logger("RRT"), "%s\n", "Created new RRT Object.");
 
-    //Read in spline points
-    std::string file_name = ament_index_cpp::get_package_share_directory("rrt_star") + "/E1_out2_refined1.csv";
-    std::vector<float> row;
-    std::string line, number;
-    std::fstream file (file_name, ios::in);
-	if(file.is_open())
-	{
-		while(getline(file, line))
-		{
-			row.clear();
-			stringstream str(line);
-			while(getline(str, number, ','))
-				row.push_back(std::stof(number));
-			spline_points.push_back(row);
-		}
-	}
-    else{ 
-        std::cout<<"ERROR_ERROR_ERROR"<<std::endl;
-        std::cout<<"RRT.CPP Failed to open spline csv"<<std::endl;
+    // Load waypoints and create spline for pure pursuit
+    load_waypoints("E1_out2_refined1");
+    create_global_spline();
+
+    this->declare_parameter<double>("wheelbase", 0.33);
+    this->declare_parameter<double>("max_steering_angle", 0.4);
+    this->declare_parameter<double>("max_speed", 3.5);
+    this->declare_parameter<double>("min_speed", 1.0);
+
+    this->get_parameter("wheelbase", wheelbase_);
+    this->get_parameter("max_steering_angle", max_steering_angle_);
+    this->get_parameter("max_speed", max_speed_);
+    this->get_parameter("min_speed", min_speed_);
+
+    this->declare_parameter<int>("rrt_max_iter", 500);
+    this->declare_parameter<double>("rrt_max_expansion_dist", 0.5);
+    this->declare_parameter<double>("rrt_goal_threshold", 0.1);
+    this->declare_parameter<double>("rrt_near_gamma", 2.0);
+
+    this->get_parameter("rrt_max_iter", rrt_max_iter_);
+    this->get_parameter("rrt_max_expansion_dist", rrt_max_expansion_dist_);
+    this->get_parameter("rrt_goal_threshold", rrt_goal_threshold_);
+    this->get_parameter("rrt_near_gamma", rrt_near_gamma_);
+
+    this->declare_parameter<double>("rrt_update_rate", 0.04);
+    this->declare_parameter<int>("rrt_activation_hits", 8);
+    this->declare_parameter<double>("rrt_sample_radius", 3.0);
+    this->declare_parameter<double>("rrt_goal_bias", 0.1);
+
+    this->get_parameter("rrt_update_rate", rrt_update_rate_);
+    this->get_parameter("rrt_activation_hits", rrt_activation_hits_);
+    this->get_parameter("rrt_sample_radius", rrt_sample_radius_);
+    this->get_parameter("rrt_goal_bias", rrt_goal_bias_);
+
+    this->declare_parameter<double>("lookahead_distance", 3.0);
+    this->get_parameter("lookahead_distance", lookahead_distance_);
+}
+
+void RRT::load_waypoints(const std::string& map_name) {
+    std::string file_name = ament_index_cpp::get_package_share_directory("rrt_star") + "/" + map_name + ".csv";
+    std::ifstream file(file_name);
+    if (!file.is_open()) {
+        RCLCPP_ERROR(this->get_logger(), "Failed to open waypoint file: %s", file_name.c_str());
+        return;
     }
 
+    std::string line;
+    while (std::getline(file, line)) {
+        if (line.front() == '#') continue;
+        std::stringstream ss(line);
+        std::string value_str;
+        std::vector<double> row;
+        while (std::getline(ss, value_str, ',')) {
+            try {
+                row.push_back(std::stod(value_str));
+            } catch (const std::invalid_argument& e) {
+                RCLCPP_ERROR(this->get_logger(), "Failed to convert string to double: %s", value_str.c_str());
+            }
+        }
+        if(row.size() >= 2) {
+            waypoints_.push_back(row);
+        }
+    }
+    file.close();
+    RCLCPP_INFO(this->get_logger(), "Loaded %zu waypoints.", waypoints_.size());
+}
+
+void RRT::create_global_spline() {
+    if (waypoints_.size() < 2) {
+        RCLCPP_ERROR(this->get_logger(), "Not enough waypoints to create a spline.");
+        return;
+    }
+
+    std::vector<double> s, x, y;
+    s.push_back(0.0);
+    x.push_back(waypoints_[0][0]);
+    y.push_back(waypoints_[0][1]);
+
+    // Calculate arc length (s) for parameterization
+    for (size_t i = 1; i < waypoints_.size(); ++i) {
+        double dx = waypoints_[i][0] - waypoints_[i-1][0];
+        double dy = waypoints_[i][1] - waypoints_[i-1][1];
+        s.push_back(s.back() + std::sqrt(dx*dx + dy*dy));
+        x.push_back(waypoints_[i][0]);
+        y.push_back(waypoints_[i][1]);
+    }
+
+    // Create splines for x and y as a function of arc length s
+    x_spline_.set_points(s, x);
+    y_spline_.set_points(s, y);
+
+    // Generate dense points along the spline for easier lookup
+    global_spline_points_.clear();
+    double total_length = s.back();
+    for (double i = 0; i < total_length; i += 0.1) { // 10cm resolution
+        RRT_Node p;
+        p.x = x_spline_(i);
+        p.y = y_spline_(i);
+        global_spline_points_.push_back(p);
+    }
+    RCLCPP_INFO(this->get_logger(), "Global spline created with %zu points.", global_spline_points_.size());
+}
+
+void RRT::pure_pursuit_control() {
+    if (global_spline_points_.empty()) {
+        RCLCPP_WARN(this->get_logger(), "Global spline not available for Pure Pursuit.");
+        return;
+    }
+
+    // 1. Find the closest point on the path to the vehicle
+    int closest_idx = get_closest_point(global_spline_points_, current_car_pose.pose.pose.position);
+
+    // 2. Find the goal point on the path, starting the search from the closest point
+    RRT_Node global_goal_point = find_goal_point_on_path(global_spline_points_, closest_idx, lookahead_distance_);
+
+    // 3. Transform the goal point to the vehicle's frame
+    geometry_msgs::msg::Point goal_point_global_msg;
+    goal_point_global_msg.x = global_goal_point.x;
+    goal_point_global_msg.y = global_goal_point.y;
+    goal_point_global_msg.z = 0.0;
+    geometry_msgs::msg::Point transformed_goal = transform_point(goal_point_global_msg, current_car_pose.pose.pose);
+
+    // 4. Calculate the steering angle
+    double L_squared = lookahead_distance_ * lookahead_distance_;
+    double y_local = transformed_goal.y;
+    double Lwb = wheelbase_; // F1TENTH ~0.33 m
+    double curvature = (2.0 * y_local) / L_squared;
+    double steer = std::atan(Lwb * curvature);
+    steer = std::max(-max_steering_angle_, std::min(steer, max_steering_angle_));
+
+    double v = std::max(min_speed_, std::min( max_speed_ - 0.5*std::abs(steer)/max_steering_angle_ * 2.0, max_speed_ ));
+
+    // 5. Create and publish the drive message
+    auto drive_msg = std::make_unique<ackermann_msgs::msg::AckermannDriveStamped>();
+    drive_msg->header.stamp = this->get_clock()->now();
+    drive_msg->header.frame_id = "base_link"; // Or whatever the robot base frame is
+    drive_msg->drive.steering_angle = static_cast<float>(steer);
+    drive_msg->drive.speed = v;
+    drive_pub_->publish(std::move(drive_msg));
+
+    // Also publish the global goal for RRT to use if it needs to take over
+    global_goal.pose.pose.position.x = global_goal_point.x;
+    global_goal.pose.pose.position.y = global_goal_point.y;
+    global_goal.pose.pose.position.z = 0.0;
+}
+
+int RRT::get_closest_point(const std::vector<RRT_Node>& points, const geometry_msgs::msg::Point& current_pos) {
+    int closest_idx = 0;
+    double min_dist = std::numeric_limits<double>::max();
+
+    for (size_t i = 0; i < points.size(); ++i) {
+        double dx = points[i].x - current_pos.x;
+        double dy = points[i].y - current_pos.y;
+        double dist = dx*dx + dy*dy; // Use squared distance for efficiency
+        if (dist < min_dist) {
+            min_dist = dist;
+            closest_idx = i;
+        }
+    }
+    return closest_idx;
+}
+
+RRT_Node RRT::find_goal_point_on_path(const std::vector<RRT_Node>& path, int& start_index, double lookahead_distance) {
+    if (path.empty()) {
+        RCLCPP_WARN(this->get_logger(), "Cannot find goal point on an empty path.");
+        return RRT_Node(); // Return a default node
+    }
+
+    // Start searching from the given start_index to ensure we move forward along the path
+    for (size_t i = start_index; i < path.size(); ++i) {
+        double dx = path[i].x - current_car_pose.pose.pose.position.x;
+        double dy = path[i].y - current_car_pose.pose.pose.position.y;
+        double dist = std::sqrt(dx*dx + dy*dy);
+
+        if (dist >= lookahead_distance) {
+            start_index = i; // Update start_index for the next search cycle
+            return path[i];
+        }
+    }
+
+    // If no point is found far enough ahead (e.g., at the end of the path),
+    // return the last point of the path as the goal.
+    start_index = path.size() - 1;
+    return path.back();
+}
+
+geometry_msgs::msg::Point RRT::transform_point(const geometry_msgs::msg::Point& point, const geometry_msgs::msg::Pose& pose) {
+    Eigen::Quaterniond q(pose.orientation.w, pose.orientation.x, pose.orientation.y, pose.orientation.z);
+    Eigen::Isometry3d T = Eigen::Isometry3d::Identity();
+    T.linear() = q.toRotationMatrix();
+    T.translation() << pose.position.x, pose.position.y, pose.position.z;
+    Eigen::Vector3d pg(point.x, point.y, point.z);
+    Eigen::Vector3d pl = T.inverse() * pg;
+
+    geometry_msgs::msg::Point transformed_point;
+    transformed_point.x = pl.x();
+    transformed_point.y = pl.y();
+    transformed_point.z = pl.z();
+
+    return transformed_point;
+}
+
+void RRT::use_rrt_callback(const std_msgs::msg::Bool::ConstSharedPtr use_rrt_msg) {
+    use_rrt_ = use_rrt_msg->data;
 }
 void RRT::standoff_callback(const std_msgs::msg::Float32::ConstSharedPtr l_dist){
-    l_value = l_dist->data;
+    lookahead_distance_ = l_dist->data;
 }
 
 void RRT::global_goal_callback(const nav_msgs::msg::Odometry::ConstSharedPtr goal_msg){
-    global_goal = *goal_msg; 
+    global_goal = *goal_msg;
 }
 
 // Bresenham's Line Algorithm for a given origin and goal point in 2D space
@@ -165,7 +347,7 @@ std::vector<std::vector<int>> RRT::bresenhams_line_algorithm(int goal_point[2], 
     catch(...){
         std::cout<<"bresenhams failed"<<std::endl;
     }
-    
+   
 }
 
 // Function to check if RRT should be activated based on obstacle data. Utilize the Bresenhams line algorithm
@@ -182,7 +364,7 @@ void RRT::check_to_activate_rrt(std::vector<signed char> &obstacle_data){
 
         // Calculate the goal's local coordinates relative to the current car position
         float x_goal = global_goal.pose.pose.position.x - current_car_pose.pose.pose.position.x;
-        float y_goal = global_goal.pose.pose.position.y - current_car_pose.pose.pose.position.y; 
+        float y_goal = global_goal.pose.pose.position.y - current_car_pose.pose.pose.position.y;
 
         Eigen::Vector3d shift_coords(x_goal, y_goal, 0);
         Eigen::Vector3d local_goal_ = rotation_mat.inverse() * shift_coords;
@@ -191,7 +373,7 @@ void RRT::check_to_activate_rrt(std::vector<signed char> &obstacle_data){
         int goal_point[2]={(local_goal_[0]/resolution)+center_x,(local_goal_[1]/resolution)+center_y};
         int origin_point[2]={center_x, center_y};
         std::vector<std::vector<int>> grid_interp_points;
-        
+       
         grid_interp_points = bresenhams_line_algorithm(goal_point,origin_point);
 
         //Make Interp Points Wider
@@ -221,7 +403,7 @@ void RRT::check_to_activate_rrt(std::vector<signed char> &obstacle_data){
                     }
                 }
             }
-        } 
+        }
         //Make Current Position Wider, in case there is an obstacle adjacent to the car
         for(int i=-5;i<5;i++){
             for(int j=-5;j<5;j++){
@@ -248,10 +430,10 @@ void RRT::check_to_activate_rrt(std::vector<signed char> &obstacle_data){
                 hit_count++;
             }
         }
-        if(hit_count!=0){
-            
+        if(hit_count >= rrt_activation_hits_){ // param: activation_hits
+           
             rrt_use_it = true;
-        }   
+        }  
 
         auto new_grid= nav_msgs::msg::OccupancyGrid();
 
@@ -282,7 +464,7 @@ void RRT::check_to_activate_rrt(std::vector<signed char> &obstacle_data){
     catch(...){
         std::cout<<"RRT ACTIVATION FAILED"<<std::endl;
     }
-    
+   
 }
 
 void RRT::scan_callback(const sensor_msgs::msg::LaserScan::ConstSharedPtr scan_msg) {
@@ -303,8 +485,8 @@ void RRT::scan_callback(const sensor_msgs::msg::LaserScan::ConstSharedPtr scan_m
             y_scan = scan_msg->ranges[i] * sin(scan_msg->angle_increment * i + scan_msg->angle_min) / resolution;
 
             //Make the scans show up larger on the occupancy grid for visualization.
-            for(int j=-4 + x_scan;j<4+ x_scan;j++){
-                for(int k=-4 + y_scan;k<4+ y_scan;k++){
+            for(int j=-2 + x_scan;j<2+ x_scan;j++){
+                for(int k=-2 + y_scan;k<2+ y_scan;k++){
                     if(j+center_x >0 && j+center_x <occu_grid_x_size){
                         if(k+center_y >0 && k+center_y <occu_grid_y_size){
                             occu_grid[(j+center_x)][occu_grid_y_size-(k+center_y)]=100;
@@ -390,11 +572,11 @@ std::vector<RRT_Node> RRT::perform_rrt(){
             q.z()= current_car_pose.pose.pose.orientation.z;
             q.w()= current_car_pose.pose.pose.orientation.w;
             auto rotation_mat = q.normalized().toRotationMatrix();
-        
+       
             //Take the pure_pursuit goal in the initial loop
             if(loop_count==0){
                 x_goal = global_goal.pose.pose.position.x - current_car_pose.pose.pose.position.x;
-                y_goal = global_goal.pose.pose.position.y - current_car_pose.pose.pose.position.y; 
+                y_goal = global_goal.pose.pose.position.y - current_car_pose.pose.pose.position.y;
             }
             else{//If pure_pursuit goal not drivable, start bringing the goal closer to the car along the spline
                 float spline_index=-1000;
@@ -407,7 +589,7 @@ std::vector<RRT_Node> RRT::perform_rrt(){
                 if (spline_index ==-1000){
                     //std::cout<<"No path was found, resorting back to original goal"<<std::endl;
                     x_goal = global_goal.pose.pose.position.x - current_car_pose.pose.pose.position.x;
-                    y_goal = global_goal.pose.pose.position.y - current_car_pose.pose.pose.position.y; 
+                    y_goal = global_goal.pose.pose.position.y - current_car_pose.pose.pose.position.y;
                 }
                 else{
                     //Make sure the chosen spline index is a realistic value
@@ -439,9 +621,9 @@ std::vector<RRT_Node> RRT::perform_rrt(){
             std::vector<RRT_Node> final_path;
 
 
-            for (int i = 0; i < max_iter; i++){
+            for (int i = 0; i < rrt_max_iter_; i++){
             struct RRT_Node x_new; //New node
-            x_rand = sample(); //Create sampled node "x_rand"
+            x_rand = sample(static_cast<double>(x_goal), static_cast<double>(y_goal)); //Create sampled node "x_rand"
             x_nearest = nearest(tree, x_rand); //closest neigbor in tree
             x_new = steer(tree[x_nearest], x_rand); //get new point
             x_new.parent = x_nearest; //Record the parent and add to the tree
@@ -462,8 +644,8 @@ std::vector<RRT_Node> RRT::perform_rrt(){
 
                     double cost = tree[near_node_index].cost + line_cost(tree[near_node_index], x_new); // claculate line cost for each new neighbor and add it to parent cost
 
-                    if (cost < x_new.cost) { 
-			// if there is a node in vicinity that has a clear connectivity, then update the cost, parent and store the best neighbor index
+                    if (cost < x_new.cost) {
+// if there is a node in vicinity that has a clear connectivity, then update the cost, parent and store the best neighbor index
                         x_new.cost = cost;
                         x_new.parent = near_node_index;
                         best_neighbor = near_node_index;
@@ -471,13 +653,14 @@ std::vector<RRT_Node> RRT::perform_rrt(){
                 }
 
                 for (int i = 0; i < near_neighbour_indices.size(); i++) {
-                    if (is_near_neighbor_collided[i] || i == best_neighbor) { // ensure that nearest neighbor isnt colliding with new node, or isnt self
+                    int ni = near_neighbour_indices[i];
+                    if (is_near_neighbor_collided[i] || ni == best_neighbor) { // ensure that nearest neighbor isnt colliding with new node, or isnt self
                         continue;
-                    } 
-		    // Reroute other neighbors to connect with the newest node if they are have a lower cost than their connection scheme.
-		    // This allows more efficient and directed path planning, with a well definied distance cost
-                    if (tree[near_neighbour_indices[i]].cost > x_new.cost + line_cost(x_new, tree[near_neighbour_indices[i]])) {
-                        tree[near_neighbour_indices[i]].parent = current_node_index;
+                    }
+   // Reroute other neighbors to connect with the newest node if they are have a lower cost than their connection scheme.
+   // This allows more efficient and directed path planning, with a well definied distance cost
+                    if (tree[ni].cost > x_new.cost + line_cost(x_new, tree[ni])) {
+                        tree[ni].parent = current_node_index;
                     }
                 }
 
@@ -485,7 +668,7 @@ std::vector<RRT_Node> RRT::perform_rrt(){
 
             goal_flag = is_goal(x_new, x_goal, y_goal);
             if (goal_flag == true){
-                std::cout<<"new point x: "<<x_new.x <<", new point y: "<< x_new.y <<std::endl;           
+                std::cout<<"new point x: "<<x_new.x <<", new point y: "<< x_new.y <<std::endl;          
                 found_path=true;
                 path = find_path(tree, x_new);  // Find the path
                 //Publish visualization stuff for RVIZ
@@ -516,147 +699,95 @@ std::vector<RRT_Node> RRT::perform_rrt(){
 }
 
 void RRT::pose_callback(const nav_msgs::msg::Odometry::ConstSharedPtr pose_msg) {
-    // The pose callback when subscribed to particle filter's inferred pose
-    // The RRT main loop happens here
-    // Args:
-    //    pose_msg (*PoseStamped): pointer to the incoming pose message
-    // Returns:
-    // tree as std::vector
     current_car_pose = *pose_msg;
 
-    //Update rrt according to update rate interval
-
-    try{
+    if (use_rrt_) {
+        RCLCPP_INFO_ONCE(this->get_logger(), "RRT mode activated.");
+        // RRT LOGIC
         rclcpp::Time current_time = rclcpp::Clock().now();
-        if((current_time - previous_time).seconds() > update_rate){
+        if((current_time - previous_time).seconds() > rrt_update_rate_){
             previous_time = current_time;
             found_path = false;
-	    // PERFORM RRT-star here
             final_path_output = perform_rrt();
-
         }
 
-        //Convert Local coordinates to global coordinates for pure pursuit
-        Eigen::Quaterniond q;
-        q.x()= current_car_pose.pose.pose.orientation.x;
-        q.y()= current_car_pose.pose.pose.orientation.y;
-        q.z()= current_car_pose.pose.pose.orientation.z;
-        q.w()= current_car_pose.pose.pose.orientation.w;
+        if (found_path && !final_path_output.empty()) {
+            // Transform the local RRT path to the global frame
+            std::vector<RRT_Node> global_rrt_path;
+            Eigen::Quaterniond q(current_car_pose.pose.pose.orientation.w, current_car_pose.pose.pose.orientation.x, current_car_pose.pose.pose.orientation.y, current_car_pose.pose.pose.orientation.z);
+            auto rotation_mat = q.normalized().toRotationMatrix();
 
-        auto rotation_mat = q.normalized().toRotationMatrix();
-
-        if(found_path == true){
-
-            geometry_msgs::msg::PoseArray goal_path_points;
-            goal_path_points.header.frame_id = "map";
-
-            geometry_msgs::msg::Pose point_value;
-
-            for (int i=0; i<final_path_output.size(); i++){
-
-                Eigen::Vector3d shift_coords(final_path_output[i].x, final_path_output[i].y, 0);
-                Eigen::Vector3d global_coords = rotation_mat * shift_coords;
-                point_value.position.x = current_car_pose.pose.pose.position.x + float(global_coords[0]);
-                point_value.position.y = current_car_pose.pose.pose.position.y + float(global_coords[1]);
-                point_value.position.z= final_path_output.size();
-                goal_path_points.poses.push_back(point_value);
-            }
-            spline_points_pub->publish(goal_path_points);
-
-
-            std::vector<float> local_goal;
-            if (!final_path_output.empty()) {
-                float best_dist_diff = 100000.0;
-                float lookahead_distance = l_value * 0.33;
-                for (const auto& point : final_path_output) {
-                    float dist = sqrt(pow(point.x, 2) + pow(point.y, 2));
-                    float diff = abs(dist - lookahead_distance);
-                    if (diff < best_dist_diff) {
-                        best_dist_diff = diff;
-                        local_goal = {point.x, point.y};
-                    }
-                }
+            for (const auto& local_node : final_path_output) {
+                Eigen::Vector3d local_point(local_node.x, local_node.y, 0);
+                Eigen::Vector3d global_point_offset = rotation_mat * local_point;
+                
+                RRT_Node global_node;
+                global_node.x = current_car_pose.pose.pose.position.x + global_point_offset.x();
+                global_node.y = current_car_pose.pose.pose.position.y + global_point_offset.y();
+                global_rrt_path.push_back(global_node);
             }
 
-            //Convert Local coordinates to global coordinates for pure pursuit
+            // Follow the RRT path using pure pursuit logic on the global path
+            int closest_idx_rrt = get_closest_point(global_rrt_path, current_car_pose.pose.pose.position);
+            RRT_Node rrt_goal_point = find_goal_point_on_path(global_rrt_path, closest_idx_rrt, lookahead_distance_ / 1.5); // Use a shorter lookahead for tighter control
 
-            Eigen::Vector3d shift_coords(local_goal[0], local_goal[1], 0);
-            Eigen::Vector3d global_coords = rotation_mat * shift_coords;
+            geometry_msgs::msg::Point goal_point_global_msg;
+            goal_point_global_msg.x = rrt_goal_point.x;
+            goal_point_global_msg.y = rrt_goal_point.y;
+            goal_point_global_msg.z = 0.0;
+            geometry_msgs::msg::Point transformed_goal = transform_point(goal_point_global_msg, current_car_pose.pose.pose);
 
+            double lookahead_rrt = lookahead_distance_ / 1.5;
+            double L_squared = lookahead_rrt * lookahead_rrt;
+            double y_local = transformed_goal.y;
+            double Lwb = wheelbase_; // F1TENTH ~0.33 m
+            double curvature = (2.0 * y_local) / L_squared;
+            double steer = std::atan(Lwb * curvature);
+            steer = std::max(-max_steering_angle_, std::min(steer, max_steering_angle_));
 
-            current_goal.pose.pose.position.x = current_car_pose.pose.pose.position.x + float(global_coords[0]);
-            current_goal.pose.pose.position.y = current_car_pose.pose.pose.position.y + float(global_coords[1]);
-
-            current_goal.header.stamp = rclcpp::Clock().now();
-            current_goal.header.frame_id="map";
-            local_goal_pub->publish(current_goal);
-
-            //Convert back to local coordinate frame so that it can be used in the perform_rrt function
-            current_goal.pose.pose.position.x =  float(local_goal[0]);
-            current_goal.pose.pose.position.y =  float(local_goal[1]);
-        }
-        else{
-                    //Couldn't find a path to use pushing back original goal points
-                    std::cout<<"IN FAILURE MODE"<<std::endl;
-                    std::vector<float> local_goal;
-                    float x_goal = global_goal.pose.pose.position.x - current_car_pose.pose.pose.position.x;//global_goal.pose.pose.position.x;//2.5; This is in local coordinates
-                    float y_goal = global_goal.pose.pose.position.y - current_car_pose.pose.pose.position.y;
-                    local_goal.push_back(x_goal);
-                    local_goal.push_back(y_goal);
-                    std::cout<<"pushed global goal points"<<std::endl;
-
-                    //Convert Local coordinates to global coordinates for pure pursuit
-                    Eigen::Quaterniond q;
-                    q.x()= current_car_pose.pose.pose.orientation.x;
-                    q.y()= current_car_pose.pose.pose.orientation.y;
-                    q.z()= current_car_pose.pose.pose.orientation.z;
-                    q.w()= current_car_pose.pose.pose.orientation.w;
-
-                    auto rotation_mat = q.normalized().toRotationMatrix();
-
-                    Eigen::Vector3d shift_coords(local_goal[0], local_goal[1], 0);
-                    Eigen::Vector3d global_coords = rotation_mat * shift_coords;
-
-
-                    current_goal.pose.pose.position.x = current_car_pose.pose.pose.position.x + float(global_coords[0]);
-                    current_goal.pose.pose.position.y = current_car_pose.pose.pose.position.y + float(global_coords[1]);
-
-                    current_goal.header.stamp = rclcpp::Clock().now();
-                    current_goal.header.frame_id="map";
-                    local_goal_pub->publish(current_goal);
-
-                    //Convert back to local coordinate frame so that it can be used in the perform_rrt function
-                    current_goal.pose.pose.position.x =  float(local_goal[0]);
-                    current_goal.pose.pose.position.y =  float(local_goal[1]);
-
+            auto drive_msg = std::make_unique<ackermann_msgs::msg::AckermannDriveStamped>();
+            drive_msg->header.stamp = this->get_clock()->now();
+            drive_msg->header.frame_id = "base_link";
+            drive_msg->drive.steering_angle = static_cast<float>(steer);
+            drive_msg->drive.speed = 0.8f; // Slower speed for obstacle avoidance
+            drive_pub_->publish(std::move(drive_msg));
+        } else {
+            // If RRT is active but no path is found, stop the car for safety.
+            RCLCPP_WARN(this->get_logger(), "RRT active, but no path found. Stopping car.");
+            auto drive_msg = std::make_unique<ackermann_msgs::msg::AckermannDriveStamped>();
+            drive_msg->header.stamp = this->get_clock()->now();
+            drive_msg->header.frame_id = "base_link";
+            drive_msg->drive.steering_angle = 0.0f;
+            drive_msg->drive.speed = 0.0f;
+            drive_pub_->publish(std::move(drive_msg));
         }
 
-
-
+    } else {
+        RCLCPP_INFO_ONCE(this->get_logger(), "Pure Pursuit mode activated.");
+        // PURE PURSUIT LOGIC
+        pure_pursuit_control();
     }
-    catch(...){
-        std::cout<<"IN Catch"<<std::endl;
-    }
-
-    //path found as Path message
 }
 
-std::vector<double> RRT::sample() {
+std::vector<double> RRT::sample(double goal_x, double goal_y) {
     // This method returns a sampled point from the free space
     // You should restrict so that it only samples a small region
     // of interest around the car's current position
     // Args:
     // Returns:
     //     sampled_point (std::vector<double>): the sampled point in free space
-
-    std::vector<double> sampled_point;
-
-    double x_rand = (x_dist(gen) - .5) * occu_grid_x_size  * resolution + (occu_grid_x_size * 0.2 * resolution);
-    double y_rand = (y_dist(gen) - .5) * occu_grid_y_size  * resolution;
-
-    sampled_point.push_back(x_rand);
-    sampled_point.push_back(y_rand);
-
+    std::uniform_real_distribution<double> uni(0.0,1.0);
+    if (uni(gen) < rrt_goal_bias_) {
+        std::vector<double> goal_point = {goal_x, goal_y};
+        return goal_point; // 10% goal bias (goal in local frame)
+    }
+    
+    // forward cone sampling
+    double R = rrt_sample_radius_;          // param: sampling radius [m]
+    double th = (uni(gen)-0.5) * (M_PI/2.0); // +/-45°
+    double r = std::uniform_real_distribution<double>(0.3, R)(gen);
+    
+    std::vector<double> sampled_point = { r*std::cos(th), r*std::sin(th) };
     return sampled_point;
 }
 
@@ -681,7 +812,7 @@ int RRT::nearest(std::vector<RRT_Node> &tree, std::vector<double> &sampled_point
       //Calculate the distance between sampled point and tree node
       cur_x = tree[i].x;
       cur_y = tree[i].y;
-      cur_dist = std::sqrt(std::pow(cur_x - x, 2) + std::pow(cur_y - y, 2) * 1.0);
+      cur_dist = std::sqrt(std::pow(cur_x - x, 2) + std::pow(cur_y - y, 2));
 
       //Check if less than the best distance
       if (cur_dist < min_dist){
@@ -713,8 +844,8 @@ RRT_Node RRT::steer(RRT_Node &nearest_node, std::vector<double> &sampled_point) 
     double dy = sampled_point[1] - nearest_node.y;
     double angle = atan2(dy,dx);
 
-    double dx_new = max_expansion_dist * cos(angle);
-    double dy_new = max_expansion_dist * sin(angle);
+    double dx_new = rrt_max_expansion_dist_ * cos(angle);
+    double dy_new = rrt_max_expansion_dist_ * sin(angle);
 
     new_node.x = dx_new + nearest_node.x;
     new_node.y = dy_new + nearest_node.y;
@@ -761,6 +892,10 @@ bool RRT::check_collision(RRT_Node &nearest_node, RRT_Node &new_node) {
 
     bool collision = false;
     while(1){
+        if(!(0<=x0 && x0<occu_grid_x_size && 0<=y0 && y0<occu_grid_y_size)) {
+          collision = true;
+          break;
+        }
         if(occu_grid[x0][y0] > 70){
           collision = true;
           break;
@@ -802,7 +937,7 @@ bool RRT::is_goal(RRT_Node &node, double goal_x, double goal_y) {
     double node_x = node.x;
     double node_y = node.y;
 
-    if(sqrt(pow(goal_x-node_x,2) + pow(goal_y-node_y,2)) < goal_threshold){
+    if(sqrt(pow(goal_x-node_x,2) + pow(goal_y-node_y,2)) < rrt_goal_threshold_){
         close_enough = true;
     }
     return close_enough;
@@ -878,10 +1013,14 @@ std::vector<int> RRT::near(std::vector<RRT_Node> &tree, RRT_Node &node) {
     //   neighborhood (std::vector<int>): the index of the nodes in the neighborhood
 
     std::vector<int> neighborhood;
-    float search_radius = 1.5; // can be tweaked
+    double gamma = rrt_near_gamma_;
+    int d = 2;
+    double num_nodes = static_cast<double>(tree.size());
+    double r_near = gamma * std::pow(std::log(std::max(num_nodes, 2.0)) / std::max(num_nodes, 2.0), 1.0/d);
+    double search_radius = std::max(0.5, std::min(r_near, 2.0));
 
-    for(int i=0; i<tree.size(); i++){
-        const double distance = sqrt(pow(node.x - tree[i].x, 2) + pow(node.y - tree[i].y, 2));
+    for(size_t i=0; i<tree.size(); i++){
+        const double distance = std::sqrt(std::pow(node.x - tree[i].x, 2) + std::pow(node.y - tree[i].y, 2));
         if(distance < search_radius){
             neighborhood.push_back(i);
         }
