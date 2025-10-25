@@ -20,16 +20,15 @@ class MultiLanePurePursuit(Node):
         # ===== Parameters =====
         self.is_real = False
         self.map_name = 'E1_out2_race'
-        self.wheelbase = 1.0  # [m]
         self.steering_gain = 0.5
-        self.ref_speed = 4.0
         self.speed_reducing_rate = 0.6
         self.max_sight = 4.0
-        self.steering_limit = 0.4  # radians
+        self.steering_limit = 0.35  # radians
 
         # Speed-dependent lookahead
         self.lookahead_norm = 1.0 # Lookahead for normal speed
         self.lookahead_slow = 0.8 # Lookahead for decelerated speed
+        self.wheelbase = self.lookahead_norm  # [m]
 
         # Multi-lane parameters
         self.lane_offsets = [-0.6, -0.3, 0.0, 0.3, 0.6]
@@ -41,7 +40,7 @@ class MultiLanePurePursuit(Node):
 
         # ===== Local Occupancy Grid Parameters (LiDAR-based) =====
         self.grid_res = 0.05  # [m/cell]
-        self.grid_forward = 2.2  # [m]
+        self.grid_forward = 3.0  # [m]
         self.grid_side = 1.0  # [m]
         self.inflate_radius_m = 0.15  # [m]
         self.inflate_iters = max(1, int(self.inflate_radius_m / self.grid_res))
@@ -61,6 +60,10 @@ class MultiLanePurePursuit(Node):
         map_path = os.path.abspath(os.path.join('src', "f1tenth-software-stack", 'csv_data'))
         csv_data = np.loadtxt(f"{map_path}/{self.map_name}.csv", delimiter=';', skiprows=1)
         self.waypoints = csv_data[:, 1:3]
+        if self.is_real:
+            self.ref_speed = csv_data[:, 5] * 0.33
+        else:
+            self.ref_speed = 4.0
         self.numWaypoints = self.waypoints.shape[0]
         self._generate_lanes()
         self.active_waypoints = self.lanes[self.current_lane_idx]
@@ -80,6 +83,7 @@ class MultiLanePurePursuit(Node):
         self.currY = 0.0
         self.rot = np.eye(3)
         self.have_pose = False
+        self.centerline_closest_index = 0
 
         # Latest local grid
         self.local_grid = np.zeros((self.grid_h, self.grid_w), dtype=np.uint8)
@@ -137,18 +141,28 @@ class MultiLanePurePursuit(Node):
         self.rot = transform.Rotation.from_quat(quat).as_matrix()
         self.have_pose = True
 
+        # Find closest waypoint on centerline for speed profile
+        curr_pos = np.array([self.currX, self.currY]).reshape((1, 2))
+        distances = distance.cdist(curr_pos, self.waypoints, 'euclidean').reshape((-1))
+        self.centerline_closest_index = np.argmin(distances)
+
         decelerate = self._select_best_lane()
         self.drive_to_target_pure_pursuit(decelerate)
 
     def drive_to_target_pure_pursuit(self, decelerate=False):
         # Determine lookahead distance and velocity
+        if self.is_real:
+            base_velocity = self.ref_speed[self.centerline_closest_index]
+        else:
+            base_velocity = self.ref_speed
+
         if decelerate:
             lookahead_dist = self.lookahead_slow
-            velocity = self.ref_speed * self.speed_reducing_rate
+            velocity = base_velocity * self.speed_reducing_rate
             print("[Deceleration] Obstacle prompted lane change, reducing speed.")
         else:
             lookahead_dist = self.lookahead_norm
-            velocity = self.ref_speed
+            velocity = base_velocity
 
         # Find the target point
         target_point = self.get_target_point(lookahead_dist)
