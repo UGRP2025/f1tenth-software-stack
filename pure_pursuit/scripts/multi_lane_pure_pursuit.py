@@ -13,26 +13,21 @@ from nav_msgs.msg import Odometry, OccupancyGrid
 from visualization_msgs.msg import Marker, MarkerArray ###
 from geometry_msgs.msg import Point ###
 
-class MultiLaneStanley(Node):
+class MultiLanePurePursuit(Node):
     def __init__(self):
-        super().__init__('multi_lane_stanley_node')
+        super().__init__('multi_lane_pure_pursuit_node')
 
         # ===== Parameters =====
         self.is_real = False
         self.map_name = 'E1_out2_refined1'
-        self.L = 1.0
+        self.L = 1.0  # Lookahead distance
         self.steering_gain = 0.5
         self.ref_speed = 4.0
         self.max_sight = 4.0
-
-        # Stanley parameters
-        self.K_E = 0.7  # Crosstrack error gain
-        self.K_H = 1.0  # Heading error gain
         self.steering_limit = 0.4  # radians
-        self.velocity_percentage = 1.0
 
         # Multi-lane parameters
-        self.lane_offsets = [-0.8, -0.6, 0.0, 0.6, 0.8]
+        self.lane_offsets = [-0.6, -0.3, 0.0, 0.3, 0.6]
         self.lanes = []
         self.current_lane_idx = 2  # Start with the center lane
         self.hysteresis_counter = 0
@@ -40,9 +35,9 @@ class MultiLaneStanley(Node):
 
         # ===== Local Occupancy Grid Parameters (LiDAR-based) =====
         self.grid_res = 0.05  # [m/cell]
-        self.grid_forward = 3.0  # [m]
-        self.grid_side = 2.0  # [m]
-        self.inflate_radius_m = 0.30  # [m]
+        self.grid_forward = 2.2  # [m]
+        self.grid_side = 1.0  # [m]
+        self.inflate_radius_m = 0.15  # [m]
         self.inflate_iters = max(1, int(self.inflate_radius_m / self.grid_res))
 
         self.grid_w = int(self.grid_forward / self.grid_res)
@@ -127,7 +122,7 @@ class MultiLaneStanley(Node):
         self.markerArray.markers.append(self.targetMarker)
 
 
-    # ============ Pure Pursuit / Stanley ==================
+    # ============ Pure Pursuit ==================
     def pose_callback(self, msg):
         self.currX = msg.pose.pose.position.x
         self.currY = msg.pose.pose.position.y
@@ -137,51 +132,26 @@ class MultiLaneStanley(Node):
         self.have_pose = True
 
         self._select_best_lane()
-        self.drive_to_target_stanley()
+        self.drive_to_target_pure_pursuit()
 
-    def drive_to_target_stanley(self):
-        """
-        Using the stanley method derivation. 
-        """
-        # Get current heading from rotation matrix
-        current_heading = transform.Rotation.from_matrix(self.rot).as_euler('xyz')[2]
+    def drive_to_target_pure_pursuit(self):
+        # Find the target point
+        target_point = self.get_target_point(self.L)
 
-        # Front axle position
-        front_x = self.currX + self.L * np.cos(current_heading)
-        front_y = self.currY + self.L * np.sin(current_heading)
-        front_axle_pos = np.array([front_x, front_y])
+        # Transform the target point to the car's coordinate frame
+        translated_target_point = self.translate_point(target_point)
 
-        # Find closest point on path to front and rear axles
-        closest_point_front_car, closest_point_front_world, _ = self._get_closest_point_on_path(front_axle_pos)
-        _, closest_point_rear_world, _ = self._get_closest_point_on_path(np.array([self.currX, self.currY]))
+        # Calculate curvature/steering angle
+        y = translated_target_point[1]
+        gamma = self.steering_gain * (2 * y / self.L**2)
+        angle = np.clip(gamma, -self.steering_limit, self.steering_limit)
 
-        path_heading = np.arctan2(closest_point_front_world[1] - closest_point_rear_world[1], 
-                                  closest_point_front_world[0] - closest_point_rear_world[0])
-
-        # Normalize angles
-        if current_heading < 0: current_heading += 2 * np.pi
-        if path_heading < 0: path_heading += 2 * np.pi
-
-        # Crosstrack error (y-value in car frame, relative to front axle)
-        crosstrack_error = closest_point_front_car[1]
-        crosstrack_error_term = np.arctan2(self.K_E * crosstrack_error, self.ref_speed)
-        
-        # Heading error
-        heading_error = path_heading - current_heading
-        if heading_error > np.pi: heading_error -= 2 * np.pi
-        elif heading_error < -np.pi: heading_error += 2 * np.pi
-        heading_error *= self.K_H
-
-        # Stanley controller formula
-        angle = heading_error + crosstrack_error_term
-        angle = np.clip(angle, -self.steering_limit, self.steering_limit)
-        
-        velocity = self.ref_speed * self.velocity_percentage
+        velocity = self.ref_speed
 
         self.drive_msg.drive.steering_angle = angle
         self.drive_msg.drive.speed = velocity
         self.pub_drive.publish(self.drive_msg)
-        print(f"[Stanley] steer={round(angle, 3)}, speed={velocity:.2f}, cte={crosstrack_error:.2f}, he={heading_error:.2f}")
+        print(f"[Pure Pursuit] steer={round(angle, 3)}, speed={velocity:.2f}")
 
         # Update and publish visualization markers
         now = self.get_clock().now().to_msg()
@@ -189,63 +159,39 @@ class MultiLaneStanley(Node):
             marker.header.stamp = now
         
         self.active_lane_marker.points = [Point(x=p[0], y=p[1], z=0.0) for p in self.active_waypoints]
-        self.targetMarker.points = [Point(x=float(closest_point_front_world[0]), y=float(closest_point_front_world[1]), z=0.0)]
+        self.targetMarker.points = [Point(x=float(target_point[0]), y=float(target_point[1]), z=0.0)]
         
         self.pub_vis.publish(self.markerArray)
 
-    def _get_closest_point_on_path(self, pos):
-        # Find closest waypoint to pos
-        dists = distance.cdist(pos.reshape(1, -1), self.active_waypoints[:, 0:2], 'euclidean').reshape(-1)
-        closest_idx = np.argmin(dists)
+    def get_target_point(self, lookahead_dist):
+        curr_pos = np.array([self.currX, self.currY]).reshape((1, 2))
+        distances = distance.cdist(curr_pos, self.active_waypoints, 'euclidean').reshape((-1))
+        closest_index = np.argmin(distances)
 
-        # Consider two segments around the closest waypoint
-        prev_idx = (closest_idx - 1 + len(self.active_waypoints)) % len(self.active_waypoints)
-        next_idx = (closest_idx + 1) % len(self.active_waypoints)
+        point_index = closest_index
+        dist = distances[point_index]
 
-        # Segment 1: prev_idx to closest_idx
-        p1_seg1 = self.active_waypoints[prev_idx, 0:2]
-        p2_seg1 = self.active_waypoints[closest_idx, 0:2]
-        l2_seg1 = np.sum((p1_seg1 - p2_seg1)**2)
-        if l2_seg1 == 0.0:
-            closest_point1 = p1_seg1
-        else:
-            t = max(0, min(1, np.dot(pos - p1_seg1, p2_seg1 - p1_seg1) / l2_seg1))
-            closest_point1 = p1_seg1 + t * (p2_seg1 - p1_seg1)
-        dist1 = np.linalg.norm(pos - closest_point1)
+        while dist < lookahead_dist:
+            point_index = (point_index + 1) % len(self.active_waypoints)
+            dist = distances[point_index]
 
-        # Segment 2: closest_idx to next_idx
-        p1_seg2 = self.active_waypoints[closest_idx, 0:2]
-        p2_seg2 = self.active_waypoints[next_idx, 0:2]
-        l2_seg2 = np.sum((p1_seg2 - p2_seg2)**2)
-        if l2_seg2 == 0.0:
-            closest_point2 = p1_seg2
-        else:
-            t = max(0, min(1, np.dot(pos - p1_seg2, p2_seg2 - p1_seg2) / l2_seg2))
-            closest_point2 = p1_seg2 + t * (p2_seg2 - p1_seg2)
-        dist2 = np.linalg.norm(pos - closest_point2)
+        return self.active_waypoints[point_index]
 
-        if dist1 < dist2:
-            closest_point_world = closest_point1
-            path_segment_start = p1_seg1
-            path_segment_end = p2_seg1
-        else:
-            closest_point_world = closest_point2
-            path_segment_start = p1_seg2
-            path_segment_end = p2_seg2
+    def translate_point(self, target_point):
+        # Create a 4x4 homogeneous transformation matrix
+        H = np.zeros((4, 4))
+        H[0:3, 0:3] = self.rot.T  # Transpose of rotation matrix for world to car frame
+        H[0:3, 3] = -self.rot.T @ np.array([self.currX, self.currY, 0.0])
+        H[3, 3] = 1.0
 
-        # Transform closest point to car frame (origin at pos)
-        yaw = transform.Rotation.from_matrix(self.rot).as_euler('xyz')[2]
-        R_wc = np.array([[np.cos(yaw), -np.sin(yaw)], [np.sin(yaw), np.cos(yaw)]])
-        R_cw = R_wc.T
-        
-        p_relative = closest_point_world - pos
-        closest_point_car = R_cw @ p_relative
+        # Convert target point to homogeneous coordinates
+        target_homogeneous = np.array([target_point[0], target_point[1], 0.0, 1.0])
 
-        # Path heading
-        path_vector = path_segment_end - path_segment_start
-        path_heading = np.arctan2(path_vector[1], path_vector[0])
+        # Apply the transformation
+        transformed_target = H @ target_homogeneous
 
-        return closest_point_car, closest_point_world, path_heading
+        return transformed_target[0:3]
+
 
     # ========================= Lane Generation and Selection =========================
     def _generate_lanes(self):
@@ -292,6 +238,7 @@ class MultiLaneStanley(Node):
             self.hysteresis_counter += 1
             if self.hysteresis_counter >= self.hysteresis_threshold:
                 self.current_lane_idx = best_lane_idx
+                print(f"[Lane Change] Switched to lane {self.current_lane_idx} (offset: {self.lane_offsets[self.current_lane_idx]}m)")
                 self.hysteresis_counter = 0
         else:
             self.hysteresis_counter = 0
@@ -373,8 +320,8 @@ class MultiLaneStanley(Node):
 
 def main(args=None):
     rclpy.init(args=args)
-    node = MultiLaneStanley()
-    print("[INFO] Multi Lane Stanley Node initialized")
+    node = MultiLanePurePursuit()
+    print("[INFO] Multi Lane Pure Pursuit Node initialized")
     rclpy.spin(node)
     node.destroy_node()
     rclpy.shutdown()
