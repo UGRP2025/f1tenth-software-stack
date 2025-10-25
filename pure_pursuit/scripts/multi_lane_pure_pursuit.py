@@ -19,12 +19,17 @@ class MultiLanePurePursuit(Node):
 
         # ===== Parameters =====
         self.is_real = False
-        self.map_name = 'E1_out2_refined1'
-        self.L = 1.0  # Lookahead distance
+        self.map_name = 'E1_out2_race'
+        self.wheelbase = 1.0  # [m]
         self.steering_gain = 0.5
         self.ref_speed = 4.0
+        self.speed_reducing_rate = 0.6
         self.max_sight = 4.0
         self.steering_limit = 0.4  # radians
+
+        # Speed-dependent lookahead
+        self.lookahead_norm = 1.0 # Lookahead for normal speed
+        self.lookahead_slow = 0.8 # Lookahead for decelerated speed
 
         # Multi-lane parameters
         self.lane_offsets = [-0.6, -0.3, 0.0, 0.3, 0.6]
@@ -32,6 +37,7 @@ class MultiLanePurePursuit(Node):
         self.current_lane_idx = 2  # Start with the center lane
         self.hysteresis_counter = 0
         self.hysteresis_threshold = 3
+        self.opposite_lane_penalty = 1.0  # Penalty for choosing opposite lane
 
         # ===== Local Occupancy Grid Parameters (LiDAR-based) =====
         self.grid_res = 0.05  # [m/cell]
@@ -53,8 +59,8 @@ class MultiLanePurePursuit(Node):
 
         # Waypoints
         map_path = os.path.abspath(os.path.join('src', "f1tenth-software-stack", 'csv_data'))
-        csv_data = np.loadtxt(f"{map_path}/{self.map_name}.csv", delimiter=',', skiprows=1)
-        self.waypoints = csv_data[:, 0:2]
+        csv_data = np.loadtxt(f"{map_path}/{self.map_name}.csv", delimiter=';', skiprows=1)
+        self.waypoints = csv_data[:, 1:3]
         self.numWaypoints = self.waypoints.shape[0]
         self._generate_lanes()
         self.active_waypoints = self.lanes[self.current_lane_idx]
@@ -122,7 +128,7 @@ class MultiLanePurePursuit(Node):
         self.markerArray.markers.append(self.targetMarker)
 
 
-    # ============ Pure Pursuit ==================
+    # ============ Pure Pursuit / Stanley ==================
     def pose_callback(self, msg):
         self.currX = msg.pose.pose.position.x
         self.currY = msg.pose.pose.position.y
@@ -131,27 +137,34 @@ class MultiLanePurePursuit(Node):
         self.rot = transform.Rotation.from_quat(quat).as_matrix()
         self.have_pose = True
 
-        self._select_best_lane()
-        self.drive_to_target_pure_pursuit()
+        decelerate = self._select_best_lane()
+        self.drive_to_target_pure_pursuit(decelerate)
 
-    def drive_to_target_pure_pursuit(self):
+    def drive_to_target_pure_pursuit(self, decelerate=False):
+        # Determine lookahead distance and velocity
+        if decelerate:
+            lookahead_dist = self.lookahead_slow
+            velocity = self.ref_speed * self.speed_reducing_rate
+            print("[Deceleration] Obstacle prompted lane change, reducing speed.")
+        else:
+            lookahead_dist = self.lookahead_norm
+            velocity = self.ref_speed
+
         # Find the target point
-        target_point = self.get_target_point(self.L)
+        target_point = self.get_target_point(lookahead_dist)
 
         # Transform the target point to the car's coordinate frame
         translated_target_point = self.translate_point(target_point)
 
         # Calculate curvature/steering angle
         y = translated_target_point[1]
-        gamma = self.steering_gain * (2 * y / self.L**2)
+        gamma = self.steering_gain * (2 * y / self.wheelbase**2)
         angle = np.clip(gamma, -self.steering_limit, self.steering_limit)
-
-        velocity = self.ref_speed
 
         self.drive_msg.drive.steering_angle = angle
         self.drive_msg.drive.speed = velocity
         self.pub_drive.publish(self.drive_msg)
-        print(f"[Pure Pursuit] steer={round(angle, 3)}, speed={velocity:.2f}")
+        print(f"[Pure Pursuit] steer={round(angle, 3)}, speed={velocity:.2f}, lookahead={lookahead_dist:.1f}")
 
         # Update and publish visualization markers
         now = self.get_clock().now().to_msg()
@@ -221,29 +234,47 @@ class MultiLanePurePursuit(Node):
     def _select_best_lane(self):
         """
         Selects the best lane based on collision checking and a cost function.
+        Returns whether to decelerate.
         """
+        original_lane_idx = self.current_lane_idx
         best_lane_idx = self.current_lane_idx
         min_cost = float('inf')
 
+        # Check for collisions on all lanes
+        lane_is_colliding = [self._check_lane_for_collision(lane) for lane in self.lanes]
+
         for i, lane in enumerate(self.lanes):
-            is_colliding = self._check_lane_for_collision(lane)
-            if not is_colliding:
+            if not lane_is_colliding[i]:
                 cost = abs(self.lane_offsets[i]) # Simple cost: prefer center lane
+
+                # Add penalty for choosing an opposite lane in a short period
+                is_opposite_side = (self.current_lane_idx < 2 and i > 2) or \
+                                   (self.current_lane_idx > 2 and i < 2)
+                if is_opposite_side:
+                    cost += self.opposite_lane_penalty
+                
                 if cost < min_cost:
                     min_cost = cost
                     best_lane_idx = i
         
-        # Hysteresis
+        # Hysteresis and lane change logic
+        lane_changed = False
         if best_lane_idx != self.current_lane_idx:
             self.hysteresis_counter += 1
             if self.hysteresis_counter >= self.hysteresis_threshold:
                 self.current_lane_idx = best_lane_idx
                 print(f"[Lane Change] Switched to lane {self.current_lane_idx} (offset: {self.lane_offsets[self.current_lane_idx]}m)")
                 self.hysteresis_counter = 0
+                lane_changed = True
         else:
             self.hysteresis_counter = 0
             
         self.active_waypoints = self.lanes[self.current_lane_idx]
+
+        # Determine if deceleration is needed
+        # Decelerate if we changed lanes because the old lane was blocked.
+        decelerate = lane_changed and lane_is_colliding[original_lane_idx]
+        return decelerate
 
     def _check_lane_for_collision(self, lane):
         """
