@@ -11,7 +11,7 @@ from sensor_msgs.msg import LaserScan
 from ackermann_msgs.msg import AckermannDriveStamped
 from nav_msgs.msg import Odometry, OccupancyGrid
 from visualization_msgs.msg import Marker, MarkerArray ###
-from geometry_msgs.msg import Point ###
+from geometry_msgs.msg import Point, PointStamped, QuaternionStamped, TransformStamped, PoseStamped
 
 class MultiLanePurePursuit(Node):
     def __init__(self):
@@ -19,30 +19,32 @@ class MultiLanePurePursuit(Node):
 
         # ===== Parameters =====
         self.is_real = False
-        self.map_name = 'E1_out2_race'
+        self.map_name = 'E1_out2_refined'
         self.steering_gain = 0.5
         self.speed_reducing_rate = 0.6
         self.max_sight = 4.0
         self.steering_limit = 0.35  # radians
 
         # Speed-dependent lookahead
-        self.lookahead_norm = 1.0 # Lookahead for normal speed
-        self.lookahead_slow = 0.8 # Lookahead for decelerated speed
+        self.lookahead_norm = 2.0 # Lookahead for normal speed
+        self.lookahead_slow = 1.8 # Lookahead for decelerated speed
         self.wheelbase = self.lookahead_norm  # [m]
 
         # Multi-lane parameters
-        self.lane_offsets = [-0.6, -0.3, 0.0, 0.3, 0.6]
+        self.lane_offsets = [-0.8, -0.4, 0.0, 0.4, 0.8]
         self.lanes = []
         self.current_lane_idx = 2  # Start with the center lane
         self.hysteresis_counter = 0
-        self.hysteresis_threshold = 3
+        self.hysteresis_threshold = 0
         self.opposite_lane_penalty = 1.0  # Penalty for choosing opposite lane
+        self.lane_switch_timer = 0
+        self.lane_switch_cooldown = 30 # cycles
 
         # ===== Local Occupancy Grid Parameters (LiDAR-based) =====
         self.grid_res = 0.05  # [m/cell]
         self.grid_forward = 3.0  # [m]
         self.grid_side = 1.0  # [m]
-        self.inflate_radius_m = 0.15  # [m]
+        self.inflate_radius_m = 0.3  # [m]
         self.inflate_iters = max(1, int(self.inflate_radius_m / self.grid_res))
 
         self.grid_w = int(self.grid_forward / self.grid_res)
@@ -51,7 +53,7 @@ class MultiLanePurePursuit(Node):
 
         # ===== Topics/Publishers =====
         odom_topic = '/pf/viz/inferred_pose' if self.is_real else '/ego_racecar/odom'
-        self.sub_pose = self.create_subscription(Odometry, odom_topic, self.pose_callback, 1)
+        self.sub_pose = self.create_subscription(PoseStamped if self.is_real else Odometry, odom_topic, self.pose_callback, 1)
 
         self.pub_drive = self.create_publisher(AckermannDriveStamped, '/drive', 1)
         self.drive_msg = AckermannDriveStamped()
@@ -61,7 +63,7 @@ class MultiLanePurePursuit(Node):
         csv_data = np.loadtxt(f"{map_path}/{self.map_name}.csv", delimiter=';', skiprows=1)
         self.waypoints = csv_data[:, 1:3]
         if self.is_real:
-            self.ref_speed = csv_data[:, 5] * 0.33
+            self.ref_speed = csv_data[:, 5] * 0.6
         else:
             self.ref_speed = 4.0
         self.numWaypoints = self.waypoints.shape[0]
@@ -133,10 +135,10 @@ class MultiLanePurePursuit(Node):
 
 
     # ============ Pure Pursuit / Stanley ==================
-    def pose_callback(self, msg):
-        self.currX = msg.pose.pose.position.x
-        self.currY = msg.pose.pose.position.y
-        quat = msg.pose.pose.orientation
+    def pose_callback(self, pose_msg):
+        self.currX = pose_msg.pose.position.x if self.is_real else pose_msg.pose.pose.position.x
+        self.currY = pose_msg.pose.position.y if self.is_real else pose_msg.pose.pose.position.y
+        quat = pose_msg.pose.orientation if self.is_real else pose_msg.pose.pose.orientation
         quat = [quat.x, quat.y, quat.z, quat.w]
         self.rot = transform.Rotation.from_quat(quat).as_matrix()
         self.have_pose = True
@@ -251,11 +253,20 @@ class MultiLanePurePursuit(Node):
         Returns whether to decelerate.
         """
         original_lane_idx = self.current_lane_idx
-        best_lane_idx = self.current_lane_idx
-        min_cost = float('inf')
+
+        if self.lane_switch_timer > 0:
+            self.lane_switch_timer -= 1
 
         # Check for collisions on all lanes
         lane_is_colliding = [self._check_lane_for_collision(lane) for lane in self.lanes]
+
+        # If current lane is not colliding and we are in a cooldown period, stay in the lane.
+        if not lane_is_colliding[self.current_lane_idx] and self.lane_switch_timer > 0:
+            self.active_waypoints = self.lanes[self.current_lane_idx]
+            return False
+
+        best_lane_idx = self.current_lane_idx
+        min_cost = float('inf')
 
         for i, lane in enumerate(self.lanes):
             if not lane_is_colliding[i]:
@@ -280,6 +291,7 @@ class MultiLanePurePursuit(Node):
                 print(f"[Lane Change] Switched to lane {self.current_lane_idx} (offset: {self.lane_offsets[self.current_lane_idx]}m)")
                 self.hysteresis_counter = 0
                 lane_changed = True
+                self.lane_switch_timer = self.lane_switch_cooldown # Reset cooldown on lane change
         else:
             self.hysteresis_counter = 0
             
@@ -299,8 +311,8 @@ class MultiLanePurePursuit(Node):
         closest_idx = np.argmin(dists)
 
         # Check a horizon ahead
-        check_horizon_m = 2.0
-        check_horizon_indices = int(check_horizon_m / 0.1) # Assuming waypoints are ~0.1m apart
+        check_horizon_m = 4.0
+        check_horizon_indices = int(check_horizon_m / 0.18) # Assuming waypoints are ~0.1m apart
 
         for i in range(check_horizon_indices):
             point_idx = (closest_idx + i) % len(lane)
