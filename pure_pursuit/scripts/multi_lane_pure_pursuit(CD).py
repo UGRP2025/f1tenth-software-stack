@@ -6,6 +6,7 @@ from scipy.ndimage import binary_dilation
 import os
 
 import rclpy
+from rclpy.qos import QoSProfile, DurabilityPolicy
 from rclpy.node import Node
 from sensor_msgs.msg import LaserScan
 from ackermann_msgs.msg import AckermannDriveStamped
@@ -18,22 +19,22 @@ class MultiLanePurePursuit(Node):
         super().__init__('multi_lane_pure_pursuit_node')
 
         # ===== Parameters =====
-        self.is_real = False
-        self.map_name = 'E1_out2_refined'
+        self.is_real = True
+        self.map_name = 'E1_perfect'
         self.steering_gain = 0.5
-        self.speed_reducing_rate = 0.6
+        self.speed_reducing_rate = 1.0
         self.max_sight = 4.0
         self.steering_limit = 0.35  # radians
 
         # Speed-dependent lookahead
         self.lookahead_norm = 2.0 # Lookahead for normal speed
-        self.lookahead_slow = 1.8 # Lookahead for decelerated speed
+        self.lookahead_slow = 2.0 # Lookahead for decelerated speed
         self.wheelbase = self.lookahead_norm  # [m]
 
         # Multi-lane parameters
-        self.lane_offsets = [-0.8, -0.4, 0.0, 0.4, 0.8]
+        self.lane_offsets = [-0.5, 0.0, 0.5]
         self.lanes = []
-        self.current_lane_idx = 2  # Start with the center lane
+        self.current_lane_idx = 1  # Start with the center lane
         self.hysteresis_counter = 0
         self.hysteresis_threshold = 0
         self.opposite_lane_penalty = 1.0  # Penalty for choosing opposite lane
@@ -42,8 +43,8 @@ class MultiLanePurePursuit(Node):
 
         # ===== Local Occupancy Grid Parameters (LiDAR-based) =====
         self.grid_res = 0.05  # [m/cell]
-        self.grid_forward = 3.0  # [m]
-        self.grid_side = 1.0  # [m]
+        self.grid_forward = 5.0  # [m]
+        self.grid_side = 5.0  # [m]
         self.inflate_radius_m = 0.3  # [m]
         self.inflate_iters = max(1, int(self.inflate_radius_m / self.grid_res))
 
@@ -63,7 +64,7 @@ class MultiLanePurePursuit(Node):
         csv_data = np.loadtxt(f"{map_path}/{self.map_name}.csv", delimiter=';', skiprows=1)
         self.waypoints = csv_data[:, 1:3]
         if self.is_real:
-            self.ref_speed = csv_data[:, 5] * 0.6
+            self.ref_speed = csv_data[:, 5] * 0.8
         else:
             self.ref_speed = 4.0
         self.numWaypoints = self.waypoints.shape[0]
@@ -71,8 +72,9 @@ class MultiLanePurePursuit(Node):
         self.active_waypoints = self.lanes[self.current_lane_idx]
 
         # Viz
+        latching_qos = QoSProfile(depth=10, durability=DurabilityPolicy.TRANSIENT_LOCAL)
         visualization_topic = '/visualization_marker_array'
-        self.pub_vis = self.create_publisher(MarkerArray, visualization_topic, 1)
+        self.pub_vis = self.create_publisher(MarkerArray, visualization_topic, latching_qos)
         self.markerArray = MarkerArray()
 
         self.visualization_init()
@@ -93,6 +95,11 @@ class MultiLanePurePursuit(Node):
     def visualization_init(self):
         # Colors
         self.colors = [
+            (0.0, 1.0, 0.0, 1.0),  # Green
+            (0.5, 0.5, 1.0, 1.0),  # Light Blue
+            (1.0, 1.0, 1.0, 1.0),  # White
+            (1.0, 0.5, 0.5, 1.0),  # Light Red
+            (1.0, 0.0, 0.0, 1.0),  # Red
             (0.0, 1.0, 0.0, 1.0),  # Green
             (0.5, 0.5, 1.0, 1.0),  # Light Blue
             (1.0, 1.0, 1.0, 1.0),  # White
@@ -180,13 +187,15 @@ class MultiLanePurePursuit(Node):
         self.drive_msg.drive.steering_angle = angle
         self.drive_msg.drive.speed = velocity
         self.pub_drive.publish(self.drive_msg)
-        print(f"[Pure Pursuit] steer={round(angle, 3)}, speed={velocity:.2f}, lookahead={lookahead_dist:.1f}")
+        print(f"[Pure Pursuit] steer={round(angle, 3)}, speed={velocity:.2f}, lookahead={lookahead_dist:.1f}, lane {self.current_lane_idx}")
 
         # Update and publish visualization markers
         now = self.get_clock().now().to_msg()
+        #self.markerArray.header.stamp = now
+        #self.markerArray.header.frame_id = 'map'
         for marker in self.markerArray.markers:
             marker.header.stamp = now
-        
+            marker.header.frame_id = 'map'
         self.active_lane_marker.points = [Point(x=p[0], y=p[1], z=0.0) for p in self.active_waypoints]
         self.targetMarker.points = [Point(x=float(target_point[0]), y=float(target_point[1]), z=0.0)]
         
@@ -211,7 +220,7 @@ class MultiLanePurePursuit(Node):
         H = np.zeros((4, 4))
         H[0:3, 0:3] = self.rot.T  # Transpose of rotation matrix for world to car frame
         H[0:3, 3] = -self.rot.T @ np.array([self.currX, self.currY, 0.0])
-        H[3, 3] = 1.0
+        H[3, 3] = 1.000
 
         # Convert target point to homogeneous coordinates
         target_homogeneous = np.array([target_point[0], target_point[1], 0.0, 1.0])
@@ -263,7 +272,7 @@ class MultiLanePurePursuit(Node):
         # If current lane is not colliding and we are in a cooldown period, stay in the lane.
         if not lane_is_colliding[self.current_lane_idx] and self.lane_switch_timer > 0:
             self.active_waypoints = self.lanes[self.current_lane_idx]
-            return False
+            return True
 
         best_lane_idx = self.current_lane_idx
         min_cost = float('inf')
@@ -273,8 +282,8 @@ class MultiLanePurePursuit(Node):
                 cost = abs(self.lane_offsets[i]) # Simple cost: prefer center lane
 
                 # Add penalty for choosing an opposite lane in a short period
-                is_opposite_side = (self.current_lane_idx < 2 and i > 2) or \
-                                   (self.current_lane_idx > 2 and i < 2)
+                is_opposite_side = (self.current_lane_idx < 1 and i > 1) or \
+                                   (self.current_lane_idx > 1 and i < 1)
                 if is_opposite_side:
                     cost += self.opposite_lane_penalty
                 
@@ -311,7 +320,7 @@ class MultiLanePurePursuit(Node):
         closest_idx = np.argmin(dists)
 
         # Check a horizon ahead
-        check_horizon_m = 4.0
+        check_horizon_m = 10.0
         check_horizon_indices = int(check_horizon_m / 0.18) # Assuming waypoints are ~0.1m apart
 
         for i in range(check_horizon_indices):
